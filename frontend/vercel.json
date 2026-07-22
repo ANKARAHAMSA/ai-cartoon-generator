@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://toonify-backend.onrender.com/:path*"
+      "destination": "https://toonify-backend-8mup.onrender.com/:path*"
     },
     {
       "source": "/(.*)",
