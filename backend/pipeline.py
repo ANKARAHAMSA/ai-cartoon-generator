@@ -72,12 +72,97 @@ STYLES: dict[str, dict] = {
         "emoji": "✨",
         "lora": None,
     },
+    "vangogh": {
+        "key": "vangogh",
+        "label": "Van Gogh",
+        "description": "Post-impressionist oil painting with swirling brushstrokes",
+        "prompt_modifier": "van gogh painting style, swirling brushstrokes, thick impasto texture, vibrant yellows and blues, post-impressionist, starry night aesthetic, museum quality oil painting",
+        "emoji": "🌻",
+        "lora": None,
+    },
+    "simpsons": {
+        "key": "simpsons",
+        "label": "Simpsons",
+        "description": "Classic Simpsons cartoon with yellow skin and bold outlines",
+        "prompt_modifier": "simpsons cartoon style, yellow skin tone, bold thick black outlines, flat solid colors, matt groening art style, springfield cartoon, 2d animation",
+        "emoji": "🟡",
+        "lora": None,
+    },
+    "cyberpunk": {
+        "key": "cyberpunk",
+        "label": "Cyberpunk",
+        "description": "Neon-lit futuristic city, dark dramatic atmosphere",
+        "prompt_modifier": "cyberpunk art style, neon lights, dark futuristic city, glowing cyan and magenta, rain reflections, blade runner aesthetic, holographic, highly detailed, 4k digital art",
+        "emoji": "🌆",
+        "lora": None,
+    },
+    "watercolor": {
+        "key": "watercolor",
+        "label": "Watercolor",
+        "description": "Soft flowing watercolor with delicate paper texture",
+        "prompt_modifier": "watercolor painting, soft flowing colors, wet on wet technique, paper texture, delicate color washes, loose brushwork, fine art illustration, beautiful and expressive",
+        "emoji": "🎨",
+        "lora": None,
+    },
+    "sketch": {
+        "key": "sketch",
+        "label": "Pencil Sketch",
+        "description": "Detailed pencil sketch with fine crosshatching",
+        "prompt_modifier": "detailed pencil sketch, graphite drawing, crosshatching technique, fine line art, black and white, charcoal shading, hand-drawn, traditional art, expressive strokes",
+        "emoji": "✏️",
+        "lora": None,
+    },
 }
 
 NEGATIVE_PROMPT = (
     "ugly, blurry, low quality, deformed, disfigured, extra limbs, "
     "watermark, text, nsfw, realistic photo, photorealistic, 3d scan, grain, noise"
 )
+
+# ---------------------------------------------------------------------------
+# HuggingFace Spaces client (real SD inference via remote GPU)
+# ---------------------------------------------------------------------------
+_hf_spaces_url: Optional[str] = os.getenv("HF_SPACES_URL", "").strip() or None
+
+def _call_hf_spaces(
+    image: Image.Image,
+    style_key: str,
+    strength: float,
+    guidance_scale: float,
+    num_steps: int,
+) -> Optional[Image.Image]:
+    """Call the Gradio Space API for real GPU inference. Returns None on failure."""
+    if not _hf_spaces_url:
+        return None
+    try:
+        from gradio_client import Client, handle_file
+        import tempfile, os as _os
+
+        client = Client(_hf_spaces_url)
+
+        # Save image to temp file (gradio_client expects a file path)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            image.convert("RGB").resize((512, 512), Image.LANCZOS).save(tmp.name)
+            tmp_path = tmp.name
+
+        result_path = client.predict(
+            image=handle_file(tmp_path),
+            style_key=style_key,
+            strength=strength,
+            guidance_scale=guidance_scale,
+            num_steps=num_steps,
+            api_name="/cartoonize",
+        )
+        _os.unlink(tmp_path)
+
+        if isinstance(result_path, str) and _os.path.exists(result_path):
+            return Image.open(result_path).convert("RGB")
+        logger.warning("HF Spaces returned unexpected result type.")
+        return None
+    except Exception as e:
+        logger.warning(f"HF Spaces call failed: {e} — falling back to local/mock.")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Pipeline state (module-level singleton)
@@ -239,6 +324,13 @@ def cartoonize(
     style = STYLES[style_key]
     prompt = f"portrait, {style['prompt_modifier']}"
 
+    # ── HuggingFace Spaces (real GPU inference) ──────────────────────────────
+    if _hf_spaces_url:
+        result = _call_hf_spaces(image, style_key, strength, guidance_scale, num_steps)
+        if result is not None:
+            return result
+        logger.info("HF Spaces unavailable — falling back to local mode.")
+
     # ── Mock mode ────────────────────────────────----------------────────────
     if _mock_mode:
         return _mock_cartoonize(image, style_key)
@@ -285,6 +377,12 @@ def _mock_cartoonize(image: Image.Image, style_key: str) -> Image.Image:
         "ghibli":     lambda i: ImageEnhance.Brightness(i.filter(ImageFilter.GaussianBlur(1))).enhance(1.1),
         "comic":      lambda i: ImageEnhance.Contrast(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(1.5),
         "pixar":      lambda i: ImageEnhance.Color(i.filter(ImageFilter.SMOOTH)).enhance(2.2),
+        # New styles — mock filters
+        "vangogh":    lambda i: ImageEnhance.Color(i.filter(ImageFilter.SMOOTH_MORE).filter(ImageFilter.EDGE_ENHANCE)).enhance(2.5),
+        "simpsons":   lambda i: ImageEnhance.Color(ImageEnhance.Contrast(i).enhance(1.4)).enhance(2.8),
+        "cyberpunk":  lambda i: ImageEnhance.Color(ImageEnhance.Contrast(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(1.8)).enhance(0.4),
+        "watercolor": lambda i: ImageEnhance.Color(i.filter(ImageFilter.GaussianBlur(2))).enhance(1.6),
+        "sketch":     lambda i: ImageEnhance.Sharpness(ImageEnhance.Color(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(0.0)).enhance(3.0),
     }
 
     fn = style_filters.get(style_key, lambda i: i)
