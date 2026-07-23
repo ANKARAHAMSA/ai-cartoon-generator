@@ -363,12 +363,137 @@ def cartoonize(
 
 
 # ---------------------------------------------------------------------------
-# Mock cartoonizer (PIL filters — no GPU needed)
+# Mock cartoonizer — OpenCV bilateral + edge detection (real cartoon look)
 # ---------------------------------------------------------------------------
 def _mock_cartoonize(image: Image.Image, style_key: str) -> Image.Image:
-    """PIL-filter mock for frontend development without a GPU."""
-    img = image.convert("RGB").resize((512, 512), Image.LANCZOS)
+    """Real cartoon effect using OpenCV — CPU only, no GPU needed."""
+    try:
+        return _opencv_cartoon(image, style_key)
+    except ImportError:
+        logger.warning("OpenCV not available — falling back to PIL filters.")
+        return _pil_cartoon_fallback(image, style_key)
 
+
+def _opencv_cartoon(image: Image.Image, style_key: str) -> Image.Image:
+    """
+    Bilateral filter + adaptive threshold edge detection.
+    Produces genuine cartoon-quality output without a GPU.
+    """
+    import cv2
+    import numpy as np
+
+    img = np.array(image.convert("RGB"))
+
+    # ─ Per-style parameters ─────────────────────────────────────
+    PARAMS = {
+        #           passes  block  C    sat    bright  special
+        "disney":     (7,   9,    5,   1.45,  1.05,  None),
+        "anime":      (9,   7,    3,   1.15,  1.00,  "anime"),
+        "arcane":     (5,   9,    4,   1.85,  0.92,  "arcane"),
+        "claymation": (8,   11,   7,   1.30,  1.10,  None),
+        "ghibli":     (10,  11,   8,   1.20,  1.08,  None),
+        "comic":      (4,   7,    2,   1.70,  1.00,  "comic"),
+        "pixar":      (8,   9,    6,   1.55,  1.05,  None),
+        "vangogh":    (5,   9,    5,   2.10,  1.00,  "vangogh"),
+        "simpsons":   (6,   7,    3,   2.60,  1.10,  "simpsons"),
+        "cyberpunk":  (5,   7,    3,   0.25,  0.88,  "cyberpunk"),
+        "watercolor": (13,  13,   10,  1.30,  1.06,  "watercolor"),
+        "sketch":     (2,   7,    2,   0.00,  1.00,  "sketch"),
+    }
+    passes, block, c_val, sat, bright, special = PARAMS.get(style_key, PARAMS["disney"])
+
+    # ─ Step 1: Smooth colour regions with bilateral filter ─────────────
+    # Multiple passes give that flat-painted cartoon look
+    color = img.copy()
+    for _ in range(passes):
+        color = cv2.bilateralFilter(color, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # ─ Step 2: Detect edges from the original (not smoothed) image ─────
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray_blur = cv2.medianBlur(gray, 7)
+    edges = cv2.adaptiveThreshold(
+        gray_blur, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=block,
+        C=c_val,
+    )
+
+    # ─ Step 3: Stamp edges onto smooth colour ─────────────────────
+    edges_3ch = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+    cartoon = cv2.bitwise_and(color, edges_3ch)
+
+    # ─ Step 4: Colour grade ───────────────────────────────────
+    result = Image.fromarray(cartoon).convert("RGB")
+    if sat != 1.0:
+        result = ImageEnhance.Color(result).enhance(sat)
+    if bright != 1.0:
+        result = ImageEnhance.Brightness(result).enhance(bright)
+
+    # ─ Step 5: Style-specific post-processing ───────────────────
+    if special == "sketch":
+        # Pencil-sketch divide technique: gray / (1 - blurred_inverted)
+        gray_img = np.array(image.convert("L"))
+        inverted = 255 - gray_img
+        blurred = cv2.GaussianBlur(inverted, (21, 21), 0)
+        sketch = cv2.divide(gray_img.astype(np.float32),
+                            (255.0 - blurred.astype(np.float32) + 1e-6),
+                            scale=256.0)
+        sketch = np.clip(sketch, 0, 255).astype(np.uint8)
+        result = Image.fromarray(sketch).convert("RGB")
+
+    elif special == "cyberpunk":
+        # Neon: boost blue channel, add slight cyan tint
+        r, g, b = result.split()
+        b_arr = np.array(b, dtype=np.float32)
+        b_arr = np.clip(b_arr * 1.6, 0, 255).astype(np.uint8)
+        g_arr = np.array(g, dtype=np.float32)
+        g_arr = np.clip(g_arr * 1.2, 0, 255).astype(np.uint8)
+        result = Image.merge("RGB", (r, Image.fromarray(g_arr), Image.fromarray(b_arr)))
+        result = ImageEnhance.Contrast(result).enhance(1.5)
+
+    elif special == "simpsons":
+        # Hard colour quantization = flat Springfield cartoon look
+        result = result.quantize(colors=24, method=Image.Quantize.MEDIANCUT).convert("RGB")
+        result = ImageEnhance.Color(result).enhance(2.4)
+
+    elif special == "anime":
+        # Sharpen lines, slightly cool palette
+        result = result.filter(ImageFilter.SHARPEN)
+        r, g, b = result.split()
+        b_arr = np.clip(np.array(b, dtype=np.float32) * 1.08, 0, 255).astype(np.uint8)
+        result = Image.merge("RGB", (r, g, Image.fromarray(b_arr)))
+
+    elif special == "arcane":
+        # High contrast + slight purple tint
+        result = ImageEnhance.Contrast(result).enhance(1.6)
+        r, g, b = result.split()
+        r_arr = np.clip(np.array(r, dtype=np.float32) * 1.1, 0, 255).astype(np.uint8)
+        b_arr = np.clip(np.array(b, dtype=np.float32) * 1.25, 0, 255).astype(np.uint8)
+        result = Image.merge("RGB", (Image.fromarray(r_arr), g, Image.fromarray(b_arr)))
+
+    elif special == "vangogh":
+        # Painterly: edge-enhance + extra colour pop
+        result = result.filter(ImageFilter.EDGE_ENHANCE_MORE)
+        result = ImageEnhance.Color(result).enhance(1.3)
+
+    elif special == "comic":
+        # Bold contrast, halftone-ish look
+        result = ImageEnhance.Contrast(result).enhance(1.8)
+        result = result.filter(ImageFilter.EDGE_ENHANCE)
+
+    elif special == "watercolor":
+        # Soft, no hard edges — just the smoothed colour
+        result = Image.fromarray(color).convert("RGB")
+        result = ImageEnhance.Color(result).enhance(1.3)
+        result = result.filter(ImageFilter.GaussianBlur(1))
+
+    return result
+
+
+def _pil_cartoon_fallback(image: Image.Image, style_key: str) -> Image.Image:
+    """PIL-only fallback if OpenCV is not installed."""
+    img = image.convert("RGB").resize((512, 512), Image.LANCZOS)
     style_filters = {
         "disney":     lambda i: ImageEnhance.Color(i.filter(ImageFilter.SMOOTH_MORE)).enhance(1.8),
         "anime":      lambda i: ImageEnhance.Sharpness(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(2.0),
@@ -377,13 +502,11 @@ def _mock_cartoonize(image: Image.Image, style_key: str) -> Image.Image:
         "ghibli":     lambda i: ImageEnhance.Brightness(i.filter(ImageFilter.GaussianBlur(1))).enhance(1.1),
         "comic":      lambda i: ImageEnhance.Contrast(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(1.5),
         "pixar":      lambda i: ImageEnhance.Color(i.filter(ImageFilter.SMOOTH)).enhance(2.2),
-        # New styles — mock filters
-        "vangogh":    lambda i: ImageEnhance.Color(i.filter(ImageFilter.SMOOTH_MORE).filter(ImageFilter.EDGE_ENHANCE)).enhance(2.5),
+        "vangogh":    lambda i: ImageEnhance.Color(i.filter(ImageFilter.EDGE_ENHANCE)).enhance(2.5),
         "simpsons":   lambda i: ImageEnhance.Color(ImageEnhance.Contrast(i).enhance(1.4)).enhance(2.8),
-        "cyberpunk":  lambda i: ImageEnhance.Color(ImageEnhance.Contrast(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(1.8)).enhance(0.4),
+        "cyberpunk":  lambda i: ImageEnhance.Color(ImageEnhance.Contrast(i).enhance(1.8)).enhance(0.4),
         "watercolor": lambda i: ImageEnhance.Color(i.filter(ImageFilter.GaussianBlur(2))).enhance(1.6),
-        "sketch":     lambda i: ImageEnhance.Sharpness(ImageEnhance.Color(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(0.0)).enhance(3.0),
+        "sketch":     lambda i: ImageEnhance.Color(i.filter(ImageFilter.EDGE_ENHANCE_MORE)).enhance(0.0),
     }
-
     fn = style_filters.get(style_key, lambda i: i)
     return fn(img)
