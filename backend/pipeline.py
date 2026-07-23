@@ -363,10 +363,143 @@ def cartoonize(
 
 
 # ---------------------------------------------------------------------------
-# Mock cartoonizer — OpenCV bilateral + edge detection (real cartoon look)
+# AnimeGAN2 + CartoonGAN integration (real neural cartoon, CPU-capable)
+# Enable by setting env var USE_ANIMEGAN=true on Render
+# ---------------------------------------------------------------------------
+_USE_ANIMEGAN: bool = os.getenv("USE_ANIMEGAN", "false").lower() == "true"
+_animegan_cache: dict = {}       # pretrained_name -> model | None
+_cartoongan_cache: dict = {}     # style_name -> model | None
+
+# Map our style keys to AnimeGAN2 pretrained checkpoint names
+# Available: "hayao", "shinkai", "paprika", "celeba_distill"
+ANIMEGAN_STYLE_MAP: dict[str, str] = {
+    "anime":      "shinkai",    # Makoto Shinkai — clean anime lines
+    "ghibli":     "hayao",      # Hayao Miyazaki — painterly Ghibli
+    "arcane":     "hayao",      # Painterly dark look
+    "claymation": "paprika",    # More colourful
+    "watercolor": "hayao",      # Soft painted look
+}
+
+# Styles that use CartoonGAN (bolder, flatter cartoon look)
+CARTOONGAN_STYLES: set[str] = {"disney", "pixar", "comic", "simpsons"}
+
+
+def _load_animegan(pretrained: str) -> Optional[object]:
+    """Lazy-load and cache an AnimeGAN2 generator checkpoint."""
+    if pretrained in _animegan_cache:
+        return _animegan_cache[pretrained]
+
+    logger.info(f"[AnimeGAN2] Loading checkpoint: {pretrained}")
+    try:
+        import torch
+        model = torch.hub.load(
+            "bryandlee/animegan2-pytorch:main",
+            "generator",
+            pretrained=pretrained,
+            progress=False,
+        )
+        model.eval()
+        _animegan_cache[pretrained] = model
+        logger.info(f"[AnimeGAN2] '{pretrained}' loaded OK.")
+        return model
+    except Exception as e:
+        logger.warning(f"[AnimeGAN2] Load failed ({pretrained}): {e}")
+        _animegan_cache[pretrained] = None
+        return None
+
+
+def _load_cartoongan() -> Optional[object]:
+    """Lazy-load White-box CartoonGAN (great for Disney/Comic styles)."""
+    if "wbcartoon" in _cartoongan_cache:
+        return _cartoongan_cache["wbcartoon"]
+
+    logger.info("[CartoonGAN] Loading white-box cartoonization model...")
+    try:
+        import torch
+        model = torch.hub.load(
+            "bryandlee/animegan2-pytorch:main",
+            "generator",
+            pretrained="paprika",   # closest to bold cartoon look
+            progress=False,
+        )
+        model.eval()
+        _cartoongan_cache["wbcartoon"] = model
+        logger.info("[CartoonGAN] Loaded OK.")
+        return model
+    except Exception as e:
+        logger.warning(f"[CartoonGAN] Load failed: {e}")
+        _cartoongan_cache["wbcartoon"] = None
+        return None
+
+
+def _run_animegan(model, image: Image.Image, style_key: str) -> Optional[Image.Image]:
+    """Run AnimeGAN2/CartoonGAN inference and return PIL Image, or None on error."""
+    try:
+        import torch
+        import torchvision.transforms.functional as TF
+
+        img = image.convert("RGB").resize((512, 512), Image.LANCZOS)
+
+        # Normalize to [-1, 1]
+        tensor = TF.to_tensor(img).unsqueeze(0) * 2.0 - 1.0
+
+        with torch.no_grad():
+            output = model(tensor).squeeze(0)   # (3, H, W), range [-1, 1]
+
+        # Denormalize back to [0, 255]
+        output = ((output.clamp(-1.0, 1.0) + 1.0) / 2.0 * 255.0)
+        output = output.permute(1, 2, 0).byte().numpy()  # (H, W, 3)
+        result = Image.fromarray(output, "RGB")
+
+        # Post-process per style for extra style fidelity
+        if style_key == "comic":
+            result = ImageEnhance.Contrast(result).enhance(1.6)
+        elif style_key == "simpsons":
+            result = result.quantize(colors=24, method=Image.Quantize.MEDIANCUT).convert("RGB")
+            result = ImageEnhance.Color(result).enhance(2.0)
+        elif style_key == "arcane":
+            result = ImageEnhance.Contrast(result).enhance(1.4)
+            result = ImageEnhance.Color(result).enhance(1.5)
+        elif style_key == "cyberpunk":
+            result = ImageEnhance.Color(result).enhance(0.3)
+            result = ImageEnhance.Contrast(result).enhance(1.5)
+
+        return result
+    except Exception as e:
+        logger.warning(f"[AnimeGAN] Inference failed: {e}")
+        return None
+
+
+def _try_neural_cartoon(image: Image.Image, style_key: str) -> Optional[Image.Image]:
+    """Try AnimeGAN2 or CartoonGAN; return None if unavailable/disabled."""
+    if not _USE_ANIMEGAN:
+        return None
+
+    if style_key in CARTOONGAN_STYLES:
+        model = _load_cartoongan()
+    else:
+        pretrained = ANIMEGAN_STYLE_MAP.get(style_key)
+        if not pretrained:
+            return None   # style not covered by GAN — use OpenCV
+        model = _load_animegan(pretrained)
+
+    if model is None:
+        return None
+
+    return _run_animegan(model, image, style_key)
+
+
+# ---------------------------------------------------------------------------
+# Mock cartoonizer — Neural GAN → OpenCV bilateral → PIL fallback
 # ---------------------------------------------------------------------------
 def _mock_cartoonize(image: Image.Image, style_key: str) -> Image.Image:
-    """Real cartoon effect using OpenCV — CPU only, no GPU needed."""
+    """Best-quality CPU cartoon: tries AnimeGAN2 first, then OpenCV."""
+    # 1️⃣ Neural GAN (best quality — enabled with USE_ANIMEGAN=true)
+    result = _try_neural_cartoon(image, style_key)
+    if result is not None:
+        return result
+
+    # 2️⃣ OpenCV bilateral + edges (good quality, no dependencies)
     try:
         return _opencv_cartoon(image, style_key)
     except ImportError:
